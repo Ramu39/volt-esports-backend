@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
+import bcrypt from 'bcryptjs';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 
@@ -44,6 +45,199 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
+});
+
+/**
+ * AUTHENTICATION: REGISTER
+ * POST /api/auth/register
+ * Request Body: { username, fullName, phone, email, password, ffIgn }
+ */
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, fullName, phone, email, password, ffIgn } = req.body;
+
+    if (!username || !fullName || !phone || !email || !password) {
+      return res.status(400).json({ success: false, message: 'All fields are required.' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+    }
+
+    const cleanUsername = username.trim();
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Check duplicate
+    const { data: existing, error: checkErr } = await supabase
+      .from('profiles')
+      .select('id, username, email')
+      .or(`username.ilike.${cleanUsername},email.ilike.${cleanEmail}`)
+      .maybeSingle();
+
+    if (existing) {
+      if (existing.username.toLowerCase() === cleanUsername.toLowerCase()) {
+        return res.status(400).json({ success: false, message: 'Username is already taken.' });
+      }
+      return res.status(400).json({ success: false, message: 'Email is already registered.' });
+    }
+
+    // Hash password with bcrypt (10 rounds)
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Insert into profiles
+    const { data: newProfile, error: pErr } = await supabase
+      .from('profiles')
+      .insert([{
+        username: cleanUsername,
+        full_name: fullName.trim(),
+        phone: phone.trim(),
+        email: cleanEmail,
+        password_hash: passwordHash,
+        free_fire_ign: ffIgn ? ffIgn.trim() : '',
+        free_fire_uid: '',
+        is_admin: false,
+        is_banned: false,
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (pErr) {
+      console.error('[Auth] Register profile insert error:', pErr);
+      return res.status(500).json({ success: false, message: pErr.message || 'Registration failed' });
+    }
+
+    // Create 0-coin wallet
+    try {
+      await supabase
+        .from('wallets')
+        .insert([{
+          user_id: newProfile.id,
+          balance: 0,
+          winning_balance: 0,
+          updated_at: new Date().toISOString()
+        }]);
+    } catch (wEx) {
+      console.warn('[Auth] Wallet creation warning:', wEx.message);
+    }
+
+    console.log(`[Auth] User registered with bcrypt: ${newProfile.username} (${newProfile.id})`);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Account created successfully!',
+      user: {
+        id: newProfile.id,
+        username: newProfile.username,
+        name: newProfile.full_name,
+        phone: newProfile.phone,
+        email: newProfile.email,
+        ffIgn: newProfile.free_fire_ign,
+        walletBalance: 0,
+        winningBalance: 0,
+        isAdmin: false
+      }
+    });
+  } catch (err) {
+    console.error('[Auth] Register exception:', err);
+    return res.status(500).json({ success: false, message: err.message || 'Server error during registration' });
+  }
+});
+
+/**
+ * AUTHENTICATION: LOGIN
+ * POST /api/auth/login
+ * Request Body: { identifier, password }
+ */
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { identifier, password } = req.body;
+
+    if (!identifier || !password) {
+      return res.status(400).json({ success: false, message: 'Username/Email and Password are required.' });
+    }
+
+    const cleanId = identifier.trim().toLowerCase();
+
+    // Query user
+    const { data: user, error: uErr } = await supabase
+      .from('profiles')
+      .select('*')
+      .or(`username.ilike.${cleanId},email.ilike.${cleanId}`)
+      .maybeSingle();
+
+    if (uErr) {
+      console.error('[Auth] Login query error:', uErr);
+      return res.status(500).json({ success: false, message: 'Database error during login' });
+    }
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Account not found. Please Sign Up.' });
+    }
+
+    if (user.is_banned) {
+      return res.status(403).json({
+        success: false,
+        message: `Account is banned: ${user.ban_reason || 'Violation of rules'}`
+      });
+    }
+
+    // Verify password (bcrypt or seamless upgrade from legacy plaintext)
+    let isValidPassword = false;
+    let needsUpgrade = false;
+
+    if (user.password_hash) {
+      if (
+        user.password_hash.startsWith('$2a$') ||
+        user.password_hash.startsWith('$2b$') ||
+        user.password_hash.startsWith('$2y$')
+      ) {
+        isValidPassword = await bcrypt.compare(password, user.password_hash);
+      } else if (user.password_hash === password) {
+        isValidPassword = true;
+        needsUpgrade = true;
+      }
+    }
+
+    if (!isValidPassword) {
+      return res.status(401).json({ success: false, message: 'Incorrect password.' });
+    }
+
+    // Seamless migration: upgrade legacy plaintext password to bcrypt hash
+    if (needsUpgrade) {
+      console.log(`[Auth] Upgrading legacy password to bcrypt for user: ${user.username}`);
+      const upgradedHash = await bcrypt.hash(password, 10);
+      await supabase
+        .from('profiles')
+        .update({ password_hash: upgradedHash })
+        .eq('id', user.id);
+    }
+
+    // Fetch wallet
+    const { data: wallet } = await supabase
+      .from('wallets')
+      .select('balance, winning_balance')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    return res.json({
+      success: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.full_name || '',
+        phone: user.phone || '',
+        email: user.email || '',
+        ffIgn: user.free_fire_ign || '',
+        walletBalance: Number(wallet?.balance || 0),
+        winningBalance: Number(wallet?.winning_balance || 0),
+        isAdmin: !!user.is_admin
+      }
+    });
+  } catch (err) {
+    console.error('[Auth] Login exception:', err);
+    return res.status(500).json({ success: false, message: err.message || 'Server error during login' });
+  }
 });
 
 /**
