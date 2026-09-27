@@ -9,8 +9,16 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const PORT = process.env.PORT || 10000;
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_test_TeHee76qMq5F1C';
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'heY0XJyfevnc2bBu4z7tT6Gr';
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || '';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
+const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID || '';
+const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY || '';
+const CASHFREE_ENV = process.env.CASHFREE_ENV || 'sandbox';
+const CASHFREE_BASE_URL = CASHFREE_ENV === 'production'
+  ? 'https://api.cashfree.com/pg'
+  : 'https://sandbox.cashfree.com/pg';
+const CASHFREE_API_VERSION = '2023-08-01';
+
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://dkcljpfwvlvdcwyivhyf.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
@@ -36,8 +44,9 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'volt-esports-backend',
-    version: '1.0.0',
+    version: '1.1.0',
     timestamp: new Date().toISOString(),
+    cashfreeConfigured: !!(CASHFREE_APP_ID && CASHFREE_SECRET_KEY),
     razorpayConfigured: !!(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET),
     supabaseConfigured: !!(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
   });
@@ -239,6 +248,320 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(500).json({ success: false, message: err.message || 'Server error during login' });
   }
 });
+
+/**
+ * ==============================================================================
+ * CASHFREE PAYMENT GATEWAY ENDPOINTS
+ * ==============================================================================
+ */
+
+/**
+ * 1. CASHFREE: CREATE ORDER
+ * POST /api/cashfree/create-order
+ * Request Body: { userId, amount, email, phone, name }
+ */
+app.post('/api/cashfree/create-order', async (req, res) => {
+  try {
+    const { userId, amount, email, phone, name } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'User ID is required' });
+    }
+
+    const numAmount = Number(amount);
+    if (isNaN(numAmount) || numAmount < 10) {
+      return res.status(400).json({ success: false, message: 'Minimum deposit amount is 10 Coins' });
+    }
+
+    const cleanUserId = String(userId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 30);
+    const orderId = `cf_${cleanUserId.slice(0, 8)}_${Date.now()}`;
+    const cleanPhone = (phone && String(phone).replace(/[^0-9]/g, '').length >= 10) 
+      ? String(phone).replace(/[^0-9]/g, '').slice(-10) 
+      : '9999999999';
+    const cleanEmail = email && email.includes('@') ? email.trim() : 'gamer@bluelock.esports';
+    const cleanName = name && name.trim() ? name.trim() : 'Player';
+
+    const orderPayload = {
+      order_id: orderId,
+      order_amount: numAmount,
+      order_currency: 'INR',
+      customer_details: {
+        customer_id: cleanUserId,
+        customer_phone: cleanPhone,
+        customer_name: cleanName,
+        customer_email: cleanEmail
+      },
+      order_meta: {
+        notify_url: 'https://volt-esports-backend.onrender.com/api/cashfree/webhook'
+      },
+      order_note: `Deposit ${numAmount} Coins`
+    };
+
+    console.log(`[Cashfree] Creating order: ${orderId}, amount: ₹${numAmount} for user: ${userId}`);
+
+    const cfRes = await fetch(`${CASHFREE_BASE_URL}/orders`, {
+      method: 'POST',
+      headers: {
+        'x-client-id': CASHFREE_APP_ID,
+        'x-client-secret': CASHFREE_SECRET_KEY,
+        'x-api-version': CASHFREE_API_VERSION,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(orderPayload)
+    });
+
+    const cfData = await cfRes.json();
+
+    if (!cfRes.ok || !cfData.payment_session_id) {
+      console.error('[Cashfree] Order creation failed:', cfRes.status, cfData);
+      return res.status(cfRes.status >= 400 && cfRes.status < 500 ? cfRes.status : 500).json({
+        success: false,
+        message: cfData.message || 'Failed to create Cashfree order'
+      });
+    }
+
+    console.log(`[Cashfree] Order created successfully: ${cfData.order_id}, session: ${cfData.payment_session_id.slice(0, 15)}...`);
+
+    return res.json({
+      success: true,
+      orderId: cfData.order_id,
+      paymentSessionId: cfData.payment_session_id,
+      amount: cfData.order_amount,
+      currency: cfData.order_currency,
+      environment: CASHFREE_ENV,
+      appId: CASHFREE_APP_ID
+    });
+  } catch (error) {
+    console.error('[Cashfree] create-order exception:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Server error creating Cashfree order'
+    });
+  }
+});
+
+/**
+ * 2. CASHFREE: VERIFY PAYMENT & ATOMIC WALLET CREDIT
+ * POST /api/cashfree/verify
+ * Request Body: { orderId, userId }
+ */
+app.post('/api/cashfree/verify', async (req, res) => {
+  try {
+    const { orderId, userId } = req.body;
+
+    if (!orderId || !userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required parameters: orderId and userId'
+      });
+    }
+
+    console.log(`[Cashfree] Verifying order: ${orderId} for user: ${userId}`);
+
+    // 1. Fetch order details directly from Cashfree PG API
+    const orderRes = await fetch(`${CASHFREE_BASE_URL}/orders/${orderId}`, {
+      headers: {
+        'x-client-id': CASHFREE_APP_ID,
+        'x-client-secret': CASHFREE_SECRET_KEY,
+        'x-api-version': CASHFREE_API_VERSION
+      }
+    });
+
+    if (!orderRes.ok) {
+      const errText = await orderRes.text();
+      console.error(`[Cashfree] Failed to fetch order ${orderId}:`, orderRes.status, errText);
+      return res.status(orderRes.status).json({
+        success: false,
+        message: 'Could not fetch order status from Cashfree.'
+      });
+    }
+
+    const orderData = await orderRes.json();
+    console.log(`[Cashfree] Order ${orderId} status: ${orderData.order_status}, amount: ${orderData.order_amount}`);
+
+    const isPaid = orderData.order_status === 'PAID';
+    if (!isPaid) {
+      return res.status(400).json({
+        success: false,
+        orderStatus: orderData.order_status,
+        message: `Payment not completed. Current status: ${orderData.order_status}`
+      });
+    }
+
+    const numAmount = Number(orderData.order_amount);
+
+    // 2. Fetch payments to get cf_payment_id if available
+    let paymentId = orderId;
+    try {
+      const payRes = await fetch(`${CASHFREE_BASE_URL}/orders/${orderId}/payments`, {
+        headers: {
+          'x-client-id': CASHFREE_APP_ID,
+          'x-client-secret': CASHFREE_SECRET_KEY,
+          'x-api-version': CASHFREE_API_VERSION
+        }
+      });
+      if (payRes.ok) {
+        const payments = await payRes.json();
+        const successPay = Array.isArray(payments) ? payments.find(p => p.payment_status === 'SUCCESS') : null;
+        if (successPay?.cf_payment_id) {
+          paymentId = String(successPay.cf_payment_id);
+        }
+      }
+    } catch (_) {}
+
+    // 3. Idempotency Check in wallet_transactions (prevent replay/duplicate credits)
+    const { data: existingTx } = await supabase
+      .from('wallet_transactions')
+      .select('id, amount, status')
+      .or(`reference_id.eq.${orderId},reference_id.eq.${paymentId}`)
+      .maybeSingle();
+
+    if (existingTx) {
+      console.log(`[Cashfree] Order ${orderId} already credited previously.`);
+      const { data: wallet } = await supabase
+        .from('wallets')
+        .select('balance')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      return res.json({
+        success: true,
+        alreadyProcessed: true,
+        message: 'Payment was already processed and credited.',
+        newBalance: Number(wallet?.balance || 0),
+        orderId,
+        paymentId
+      });
+    }
+
+    // 4. Atomic Wallet Crediting in Supabase
+    let newBalance = 0;
+    let creditSuccess = false;
+
+    try {
+      const { data: rpcRes, error: rpcErr } = await supabase.rpc('cashfree_deposit_atomic', {
+        p_user_id: userId,
+        p_amount: numAmount,
+        p_order_id: orderId
+      });
+
+      if (!rpcErr && rpcRes && rpcRes.success) {
+        creditSuccess = true;
+        newBalance = rpcRes.new_balance;
+        console.log(`[Supabase] RPC cashfree_deposit_atomic succeeded. New balance: ${newBalance}`);
+      } else if (rpcErr) {
+        console.warn(`[Supabase] RPC cashfree_deposit_atomic returned error:`, rpcErr.message);
+      }
+    } catch (rpcEx) {
+      console.warn('[Supabase] RPC cashfree_deposit_atomic exception:', rpcEx.message);
+    }
+
+    // Fallback direct service-role update if RPC didn't complete
+    if (!creditSuccess) {
+      console.log('[Supabase] Applying direct wallet update with service_role for Cashfree deposit...');
+      const { data: wallet } = await supabase
+        .from('wallets')
+        .select('balance')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      const currentBalance = Number(wallet?.balance || 0);
+      newBalance = currentBalance + numAmount;
+
+      if (wallet) {
+        await supabase
+          .from('wallets')
+          .update({ balance: newBalance, updated_at: new Date().toISOString() })
+          .eq('user_id', userId);
+      } else {
+        await supabase
+          .from('wallets')
+          .insert([{ user_id: userId, balance: newBalance, winning_balance: 0 }]);
+      }
+
+      await supabase
+        .from('wallet_transactions')
+        .insert([{
+          user_id: userId,
+          type: 'DEPOSIT',
+          amount: numAmount,
+          status: 'SUCCESS',
+          payment_gateway: 'CASHFREE',
+          reference_id: orderId,
+          notes: `Added ${numAmount} Coins via Cashfree (${orderId})`,
+          created_at: new Date().toISOString()
+        }]);
+
+      console.log(`[Supabase] Direct Cashfree update succeeded. User: ${userId}, New balance: ${newBalance}`);
+    }
+
+    return res.json({
+      success: true,
+      message: 'Payment verified and wallet credited successfully.',
+      orderId,
+      paymentId,
+      amountCredited: numAmount,
+      newBalance
+    });
+  } catch (error) {
+    console.error('[Cashfree] verify error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Payment verification or wallet credit failed'
+    });
+  }
+});
+
+/**
+ * 3. CASHFREE: WEBHOOK HANDLER
+ * POST /api/cashfree/webhook
+ */
+app.post('/api/cashfree/webhook', async (req, res) => {
+  try {
+    const eventType = req.body?.type;
+    console.log(`[Cashfree Webhook] Received event: ${eventType}`);
+
+    if (eventType === 'PAYMENT_SUCCESS_WEBHOOK') {
+      const paymentData = req.body?.data?.payment;
+      const orderData = req.body?.data?.order;
+      const customerData = req.body?.data?.customer_details;
+
+      const orderId = orderData?.order_id;
+      const amount = Number(orderData?.order_amount || paymentData?.payment_amount || 0);
+      const userId = customerData?.customer_id;
+
+      if (orderId && userId && amount > 0) {
+        console.log(`[Cashfree Webhook] Auto-crediting: order=${orderId}, user=${userId}, amount=${amount}`);
+
+        const { data: existing } = await supabase
+          .from('wallet_transactions')
+          .select('id')
+          .eq('reference_id', orderId)
+          .maybeSingle();
+
+        if (!existing) {
+          await supabase.rpc('cashfree_deposit_atomic', {
+            p_user_id: userId,
+            p_amount: amount,
+            p_order_id: orderId
+          });
+          console.log(`[Cashfree Webhook] Successfully credited order ${orderId}`);
+        }
+      }
+    }
+
+    return res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('[Cashfree Webhook] Error:', err);
+    return res.status(500).send('Webhook processing error');
+  }
+});
+
+/**
+ * ==============================================================================
+ * RAZORPAY PAYMENT GATEWAY ENDPOINTS
+ * ==============================================================================
+ */
 
 /**
  * 1. CREATE RAZORPAY ORDER
