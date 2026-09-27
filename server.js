@@ -292,6 +292,7 @@ app.post('/api/cashfree/create-order', async (req, res) => {
         customer_email: cleanEmail
       },
       order_meta: {
+        return_url: 'https://volt-esports-backend.onrender.com/api/cashfree/return?order_id={order_id}',
         notify_url: 'https://volt-esports-backend.onrender.com/api/cashfree/webhook'
       },
       order_note: `Deposit ${numAmount} Coins`
@@ -338,6 +339,55 @@ app.post('/api/cashfree/create-order', async (req, res) => {
       message: error.message || 'Server error creating Cashfree order'
     });
   }
+});
+
+/**
+ * CASHFREE: REDIRECT RETURN HANDLER
+ * GET /api/cashfree/return?order_id={order_id}
+ */
+app.get('/api/cashfree/return', (req, res) => {
+  const orderId = req.query.order_id || '';
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        body {
+          background-color: #050811;
+          color: #E2E8F0;
+          font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          min-height: 100vh;
+          margin: 0;
+          flex-direction: column;
+        }
+        .spinner {
+          border: 3px solid rgba(0, 210, 255, 0.2);
+          border-top: 3px solid #00D2FF;
+          border-radius: 50%;
+          width: 36px;
+          height: 36px;
+          animation: spin 0.8s linear infinite;
+          margin-bottom: 16px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+      </style>
+    </head>
+    <body>
+      <div class="spinner"></div>
+      <p style="font-weight: 600; color: #94A3B8;">Processing payment result...</p>
+      <script>
+        const orderId = "${orderId}";
+        if (window.AndroidBridge && window.AndroidBridge.onPaymentFinished) {
+          window.AndroidBridge.onPaymentFinished(orderId);
+        }
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 /**
